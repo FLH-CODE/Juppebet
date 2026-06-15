@@ -262,7 +262,7 @@
             const arrayBuffer = await response.arrayBuffer();
             const data = new Uint8Array(arrayBuffer);
             const workbook = XLSX.read(data, {type: 'array'});
-            const json = XLSX.utils.sheet_to_json(workbook.Sheets[workbook.SheetNames[0]], {header: 1, defval: ""});
+            const json = XLSX.utils.sheet_to_json(workbook.Sheets[workbook.SheetNames[0]], {header: 1, defval: "", raw: false});
             
             processData(json);
         } catch (err) {
@@ -287,7 +287,7 @@
             try {
                 const data = new Uint8Array(e.target.result);
                 const workbook = XLSX.read(data, {type: 'array'});
-                const json = XLSX.utils.sheet_to_json(workbook.Sheets[workbook.SheetNames[0]], {header: 1, defval: ""});
+                const json = XLSX.utils.sheet_to_json(workbook.Sheets[workbook.SheetNames[0]], {header: 1, defval: "", raw: false});
                 processData(json);
             } catch (err) {
                 console.error(err);
@@ -351,8 +351,6 @@
                 if (!row) continue;
                 
                 const rowTextFull = row.slice(0, firstPCol).join(" ").toLowerCase();
-                // Ignorera rader som bara indikerar datum men saknar bindestreck (inga matcher)
-                if ((rowTextFull.includes("datum") || rowTextFull.includes("spelas")) && !rowTextFull.includes("-")) continue;
                 
                 if (rowTextFull.includes("16-del") || rowTextFull.includes("sextondel")) currentSection = '16del';
                 else if (rowTextFull.includes("åttondel") || rowTextFull.includes("8-del")) currentSection = '8del';
@@ -365,26 +363,21 @@
                 let rowHasData = false;
                 let tempGuesses = {};
 
-                // Städar och plockar ut användarnas gissningar
                 for(let p of participants) {
                     const val = row[p.colIdx];
-                    if(val !== undefined && val !== null) {
+                    if(val) {
                         const cleanVal = String(val).trim().toLowerCase();
                         if (cleanVal !== "" && cleanVal !== "1 x 2" && cleanVal !== "1x2") {
                             rowHasData = true;
-                            // Fixar konsekvent data oavsett hur man skrivit in den
-                            if (['1', 'x', '2'].includes(cleanVal)) {
-                                tempGuesses[p.id] = cleanVal.toUpperCase(); // Alltid stort X
-                            } else {
-                                // "FRANKRIKE" -> "Frankrike"
-                                tempGuesses[p.id] = cleanVal.charAt(0).toUpperCase() + cleanVal.slice(1);
-                            }
+                            // Fix: Säkerställ att 'FRANKRIKE', 'Frankrike' och ' frankrike ' matchas exakt
+                            tempGuesses[p.id] = (cleanVal.length > 3 && !['1','x','2'].includes(cleanVal)) 
+                                ? cleanVal.charAt(0).toUpperCase() + cleanVal.slice(1).toLowerCase() 
+                                : cleanVal.toUpperCase(); // För 1, X, 2 -> 1, X, 2
                         }
                     }
                 }
 
                 if (rowHasData) {
-                    // Smartare generering av rad-etiketter som är snygga att läsa
                     const labelCols = row.slice(0, firstPCol).filter(x => {
                         if(x === null || x === undefined) return false;
                         const s = String(x).trim().toLowerCase();
@@ -393,19 +386,18 @@
                     
                     let rowLabelText = "";
 
+                    // Fix: Bygger en snyggare titel för Gruppspelsmatcherna (Datum | Gr X: Match)
                     if (currentSection === 'group') {
-                        // Leta efter match-strängen (innehåller bindestreck)
                         const matchStr = labelCols.find(l => l.includes("-"));
                         if (matchStr) {
                             const otherCols = labelCols.filter(l => l !== matchStr);
-                            // Snygga till ensamma bokstäver till "Gr A" osv.
                             const formattedOther = otherCols.map(c => (c.length === 1 ? `Gr ${c.toUpperCase()}` : c));
-                            rowLabelText = `${formattedOther.join(" ")}${formattedOther.length > 0 ? ': ' : ''}${matchStr}`;
+                            rowLabelText = `${formattedOther.join(" | ")}${formattedOther.length > 0 ? ': ' : ''}${matchStr}`;
                         } else {
-                            rowLabelText = labelCols.join(" | ") || `Gruppspelsmatch`;
+                            rowLabelText = labelCols.join(" | ") || `Match rad ${r + 1}`;
                         }
                     } else {
-                        rowLabelText = labelCols.join(" | ");
+                        rowLabelText = labelCols.join(" | ") || `Match rad ${r + 1}`;
                     }
 
                     rowLabels[currentSection].push(rowLabelText);
@@ -557,6 +549,63 @@
 
             html += `</div></div>`;
         });
+        
+        if (rowLabels.group && rowLabels.group.length > 0) {
+            let groupStats = [];
+            for(let i=0; i<rowLabels.group.length; i++) {
+                let counts = {'1':0, 'X':0, '2':0};
+                let total = 0;
+                participants.forEach(p => {
+                    const g = p.guesses.group[i];
+                    if(g === '1' || g === 'X' || g === '2') {
+                        counts[g]++;
+                        total++;
+                    }
+                });
+                if(total > 0) {
+                    let topGuess = '1';
+                    let maxVotes = counts['1'];
+                    if(counts['X'] > maxVotes) { topGuess = 'X'; maxVotes = counts['X']; }
+                    if(counts['2'] > maxVotes) { topGuess = '2'; maxVotes = counts['2']; }
+                    
+                    groupStats.push({
+                        match: rowLabels.group[i],
+                        topGuess: topGuess,
+                        maxVotes: maxVotes,
+                        total: total,
+                        percentage: Math.round((maxVotes/total)*100),
+                        index: i
+                    });
+                }
+            }
+            
+            // Sortera efter högst enighet i procent
+            groupStats.sort((a,b) => b.percentage - a.percentage);
+            
+            html += `<h2 class="text-2xl font-bold text-white mt-10 mb-6 border-b border-slate-700 pb-2">Säkraste Gruppspelsmatcherna (Topp 12)</h2>`;
+            html += `<div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-5 mb-8">`;
+            
+            groupStats.slice(0, 12).forEach(stat => {
+                const color = stat.topGuess === '1' ? 'bg-sky-500' : stat.topGuess === 'X' ? 'bg-amber-500' : 'bg-emerald-500';
+                const textColor = stat.topGuess === '1' ? 'text-sky-400' : stat.topGuess === 'X' ? 'text-amber-400' : 'text-emerald-400';
+                const escapedMatch = stat.match.replace(/'/g, "\\'");
+                
+                html += `
+                <div class="bg-slate-800 rounded-xl border border-slate-700 p-4 shadow-lg group hover:border-slate-500 transition-colors cursor-pointer" 
+                     onclick="showGroupVoters(${stat.index}, '${escapedMatch}')">
+                    <div class="text-xs text-slate-400 mb-2 truncate" title="${stat.match}">${stat.match}</div>
+                    <div class="flex items-end justify-between mb-2">
+                        <div class="text-2xl font-black ${textColor}">${stat.topGuess}</div>
+                        <div class="text-sm text-slate-300">${stat.maxVotes} av ${stat.total} röster</div>
+                    </div>
+                    <div class="w-full bg-slate-700 rounded-full h-2 overflow-hidden group-hover:ring-1 ring-slate-500">
+                        <div class="${color} h-2 stat-bar" style="width: 0%" data-width="${stat.percentage}%"></div>
+                    </div>
+                </div>
+                `;
+            });
+            html += `</div>`;
+        }
 
         html += `</div>`;
         statsDashboard.innerHTML = html;
@@ -592,6 +641,41 @@
         
         html += `</div>`;
         openModal(`Vem röstade på ${team}?`, html);
+    }
+
+    function showGroupVoters(matchIndex, matchName) {
+        let voters = {'1':[], 'X':[], '2':[]};
+        participants.forEach(p => {
+            const g = p.guesses.group[matchIndex];
+            if(voters[g]) voters[g].push(p);
+        });
+        
+        const renderList = (list) => {
+            if(list.length === 0) return `<span class="text-slate-500 italic text-xs">Inga röster</span>`;
+            return list.map(v => `<span class="bg-slate-700 border border-slate-600 px-3 py-1 rounded-full text-xs text-slate-200 cursor-pointer hover:bg-sky-500 hover:text-white transition-colors" onclick="closeModal(); selectNodeAndGoToGraph('${v.id}');">${v.name}</span>`).join("");
+        };
+
+        let html = `
+            <div class="mb-6 text-center text-slate-300 text-base font-medium border-b border-slate-700 pb-4">${matchName}</div>
+            <div class="grid grid-cols-3 gap-2 md:gap-4">
+                <div class="bg-slate-700/30 p-2 md:p-4 rounded-xl border border-slate-600/50 flex flex-col">
+                    <div class="text-center font-black text-sky-400 mb-1 text-2xl">1</div>
+                    <div class="text-center text-xs text-slate-400 mb-4 pb-2 border-b border-slate-600/50">${voters['1'].length} röster</div>
+                    <div class="flex flex-wrap justify-center gap-1.5">${renderList(voters['1'])}</div>
+                </div>
+                <div class="bg-slate-700/30 p-2 md:p-4 rounded-xl border border-slate-600/50 flex flex-col">
+                    <div class="text-center font-black text-amber-400 mb-1 text-2xl">X</div>
+                    <div class="text-center text-xs text-slate-400 mb-4 pb-2 border-b border-slate-600/50">${voters['X'].length} röster</div>
+                    <div class="flex flex-wrap justify-center gap-1.5">${renderList(voters['X'])}</div>
+                </div>
+                <div class="bg-slate-700/30 p-2 md:p-4 rounded-xl border border-slate-600/50 flex flex-col">
+                    <div class="text-center font-black text-emerald-400 mb-1 text-2xl">2</div>
+                    <div class="text-center text-xs text-slate-400 mb-4 pb-2 border-b border-slate-600/50">${voters['2'].length} röster</div>
+                    <div class="flex flex-wrap justify-center gap-1.5">${renderList(voters['2'])}</div>
+                </div>
+            </div>
+        `;
+        openModal(`Röstfördelning (1 X 2)`, html);
     }
 
     function selectNodeAndGoToGraph(nodeId) {
